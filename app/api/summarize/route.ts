@@ -1,14 +1,12 @@
 
-import { GoogleGenAI } from "@google/genai";
+import Groq from "groq-sdk";
 import { NextRequest } from "next/server";
 
-
-
 const MAX_LENGTH = 12000;
+const MODEL = "openai/gpt-oss-120b";
 
 export async function POST(request: NextRequest) {
   try {
-    // Validate request body
     let body: { notes?: unknown };
 
     try {
@@ -36,58 +34,53 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Check API key
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GROQ_API_KEY;
 
     if (!apiKey) {
       return Response.json(
-        { error: "Gemini API key is not configured." },
+        { error: "Groq API key is not configured." },
         { status: 500 }
       );
     }
 
-    const ai = new GoogleGenAI({
-  apiKey,
-  httpOptions: {
-    timeout: 30000,
-  },
-});
+    const groq = new Groq({ apiKey });
 
-    const model = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+    const stream = await groq.chat.completions.create({
+      model: MODEL,
+      messages: [
+        {
+          role: "system",
+          content: `You are StudySpark, an AI study notes assistant.
 
-    const prompt = `
-You are StudySpark, an AI study notes assistant.
-
-Summarize the following study notes for a student.
-
-Follow this structure:
+Summarize the student's notes using exactly these sections:
 
 1. Overview
 2. Key Points
 3. Important Terms and Definitions
 4. Quick Revision
 
-Use clear, simple language.
+Use simple, clear language.
 Preserve important facts and technical terms.
-Do not add information that is not present in the notes.
-
-STUDY NOTES:
-${notes}
-`;
-
-    // Request a streaming response from Gemini
-    const result = await ai.models.generateContentStream({
-      model,
-      contents: prompt,
+Do not invent information that is not present in the notes.
+Use bullet points where appropriate.`,
+        },
+        {
+          role: "user",
+          content: `Summarize these study notes:\n\n${notes}`,
+        },
+      ],
+      temperature: 0.3,
+      max_completion_tokens: 2000,
+      stream: true,
     });
 
     const encoder = new TextEncoder();
 
-    const stream = new ReadableStream({
+    const responseStream = new ReadableStream({
       async start(controller) {
         try {
-          for await (const chunk of result) {
-            const text = chunk.text || "";
+          for await (const chunk of stream) {
+            const text = chunk.choices[0]?.delta?.content || "";
 
             if (text) {
               controller.enqueue(
@@ -98,18 +91,15 @@ ${notes}
             }
           }
 
-          controller.enqueue(
-            encoder.encode("data: [DONE]\n\n")
-          );
-
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         } catch (error) {
-          console.error("Gemini streaming error:", error);
+          console.error("Groq streaming error:", error);
 
           controller.enqueue(
             encoder.encode(
               `data: ${JSON.stringify({
-                error: "Unable to generate the summary. Please try again.",
+                error: "Unable to complete the summary. Please try again.",
               })}\n\n`
             )
           );
@@ -119,42 +109,31 @@ ${notes}
       },
     });
 
-    return new Response(stream, {
-      status: 200,
+    return new Response(responseStream, {
       headers: {
         "Content-Type": "text/event-stream; charset=utf-8",
         "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
+        Connection: "keep-alive",
       },
     });
+  } catch (error) {
+    console.error("Summarization API error:", error);
 
-  } catch (error: any) {
-  console.error("Summarization API error:", error);
+    const status =
+      typeof error === "object" && error !== null && "status" in error
+        ? Number(error.status)
+        : 500;
 
-  const status = error.status || error.code;
+    if (status === 429) {
+      return Response.json(
+        { error: "Groq API usage limit reached. Please try again later." },
+        { status: 429 }
+      );
+    }
 
-  if (status === 503) {
     return Response.json(
-      {
-        error: "Gemini is currently experiencing high demand. Please try again in a few minutes."
-      },
-      { status: 503 }
+      { error: "Unable to generate your summary. Please try again." },
+      { status: status >= 400 && status < 600 ? status : 500 }
     );
   }
-
-  if (status === 429) {
-    return Response.json(
-      {
-        error: "API usage limit reached. Please try again later."
-      },
-      { status: 429 }
-    );
-  }
-
-  return Response.json(
-    {
-      error: "Unable to generate your summary. Please try again."
-    },
-    { status: 500 }
-  );
-}}
+}
